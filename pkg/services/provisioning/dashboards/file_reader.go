@@ -13,6 +13,7 @@ import (
 
 	"github.com/grafana/grafana/apps/provisioning/pkg/repository/local"
 	"github.com/grafana/grafana/pkg/apimachinery/identity"
+	apimachineryutils "github.com/grafana/grafana/pkg/apimachinery/utils"
 	"github.com/grafana/grafana/pkg/components/simplejson"
 	"github.com/grafana/grafana/pkg/infra/log"
 	"github.com/grafana/grafana/pkg/infra/metrics"
@@ -169,6 +170,11 @@ func (fr *FileReader) walkDisk(ctx context.Context) error {
 	}
 	if err != nil {
 		return err
+	}
+
+	// Clean up orphaned folders if using foldersFromFilesStructure
+	if fr.FoldersFromFilesStructure {
+		fr.cleanupOrphanedProvisionedFolders(ctx, filesFoundOnDisk, resolvedPath)
 	}
 
 	fr.mux.Lock()
@@ -614,4 +620,195 @@ func (t *usageTracker) track(pm provisioningMetadata) {
 	if pm.identity.Exists() {
 		t.titleUsage[pm.identity]++
 	}
+}
+
+// cleanupOrphanedProvisionedFolders removes folders created by provisioning
+// that no longer contain dashboard files on disk.
+func (fr *FileReader) cleanupOrphanedProvisionedFolders(ctx context.Context, filesFoundOnDisk map[string]os.FileInfo, resolvedPath string) {
+	fr.log.Info("=== Starting orphaned folder cleanup ===", "filesOnDisk", len(filesFoundOnDisk), "path", resolvedPath)
+
+	foldersWithDashboardsOnDisk := fr.extractFolderUIDsFromDisk(filesFoundOnDisk, resolvedPath)
+	fr.log.Info("Folders with dashboards on disk", "count", len(foldersWithDashboardsOnDisk), "folders", foldersWithDashboardsOnDisk)
+
+	foldersProvisionedByUs := fr.extractFolderUIDsFromDB(ctx)
+	if foldersProvisionedByUs == nil {
+		fr.log.Error("Failed to get provisioned folders from DB")
+		return
+	}
+	fr.log.Info("Folders provisioned by us in DB", "count", len(foldersProvisionedByUs), "folders", foldersProvisionedByUs)
+
+	orphanedCount := 0
+	for folderUID := range foldersProvisionedByUs {
+		if foldersWithDashboardsOnDisk[folderUID] {
+			fr.log.Debug("Folder still has dashboards on disk, skipping", "folder_uid", folderUID)
+			continue
+		}
+
+		fr.log.Info("Found orphaned folder", "folder_uid", folderUID)
+		orphanedCount++
+		fr.deleteOrphanedFolder(ctx, folderUID)
+	}
+
+	fr.log.Info("=== Orphaned folder cleanup completed ===", "orphaned_count", orphanedCount)
+}
+
+// extractFolderUIDsFromDisk extracts folder UIDs from dashboards on disk.
+// Only supports single-level folders (resolvedPath/folder-name/dashboard.json).
+func (fr *FileReader) extractFolderUIDsFromDisk(filesFoundOnDisk map[string]os.FileInfo, resolvedPath string) map[string]bool {
+	folderUIDs := make(map[string]bool)
+	folderNames := make(map[string]bool)
+
+	for path := range filesFoundOnDisk {
+		dashboardsFolder := filepath.Dir(path)
+		if dashboardsFolder != resolvedPath {
+			folderName := filepath.Base(dashboardsFolder)
+			folderNames[folderName] = true
+		}
+	}
+	folderCtx, _ := identity.WithServiceIdentity(context.Background(), fr.Cfg.OrgID)
+	user, err := identity.GetRequester(folderCtx)
+	if err != nil {
+		fr.log.Error("failed to get requester for folder query", "error", err)
+		return folderUIDs
+	}
+
+	for folderName := range folderNames {
+		result, err := fr.folderService.Get(folderCtx, &folder.GetFolderQuery{
+			OrgID:        fr.Cfg.OrgID,
+			Title:        &folderName,
+			SignedInUser: user,
+		})
+		if err != nil {
+			continue
+		}
+		folderUIDs[result.UID] = true
+	}
+
+	return folderUIDs
+}
+
+// extractFolderUIDsFromDB retrieves folder UIDs created by this provisioner.
+func (fr *FileReader) extractFolderUIDsFromDB(ctx context.Context) map[string]bool {
+	folderUIDs := make(map[string]bool)
+	folderCtx, user := identity.WithServiceIdentity(ctx, fr.Cfg.OrgID)
+
+	provisionedDashboards, err3 := fr.dashboardProvisioningService.GetProvisionedDashboardData(ctx, fr.Cfg.Name)
+	if err3 != nil {
+		fr.log.Error("failed to get provisioned dashboards for folder cleanup", "error", err3)
+		return nil
+	}
+
+	fr.log.Info("Provisioned dashboards from DB", "count", len(provisionedDashboards), "provisioner", fr.Cfg.Name)
+
+	for _, pd := range provisionedDashboards {
+		dash, err := fr.dashboardStore.GetDashboard(ctx, &dashboards.GetDashboardQuery{
+			ID:    pd.DashboardID,
+			OrgID: fr.Cfg.OrgID,
+		})
+		if err != nil {
+			fr.log.Warn("failed to get dashboard details", "dashboard_id", pd.DashboardID, "error", err)
+			continue
+		}
+
+		if dash.FolderUID != "" && !dash.IsFolder {
+			folderUIDs[dash.FolderUID] = true
+		}
+	}
+
+	allFolderNames := fr.getAllKnownFolderNames()
+	fr.log.Info("Known folder names from history", "count", len(allFolderNames), "names", allFolderNames)
+
+	for folderName := range allFolderNames {
+		result, err := fr.folderService.Get(folderCtx, &folder.GetFolderQuery{
+			OrgID:        fr.Cfg.OrgID,
+			Title:        &folderName,
+			SignedInUser: user,
+		})
+		if err != nil {
+			continue
+		}
+		folderUIDs[result.UID] = true
+	}
+
+	fr.log.Info("Total folders tracked by provisioner", "count", len(folderUIDs))
+
+	return folderUIDs
+}
+
+// getAllKnownFolderNames returns all subdirectory names in the provisioning path.
+func (fr *FileReader) getAllKnownFolderNames() map[string]bool {
+	folderNames := make(map[string]bool)
+	resolvedPath := fr.resolvedPath()
+
+	entries, err := os.ReadDir(resolvedPath)
+	if err != nil {
+		fr.log.Error("failed to read provisioning directory", "path", resolvedPath, "error", err)
+		return folderNames
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			folderNames[entry.Name()] = true
+		}
+	}
+
+	fr.log.Info("Found subdirectories on disk", "count", len(folderNames), "names", folderNames)
+
+	return folderNames
+}
+
+// deleteOrphanedFolder deletes an orphaned provisioned folder.
+func (fr *FileReader) deleteOrphanedFolder(ctx context.Context, folderUID string) {
+	fr.log.Debug("Found orphaned provisioned folder", "folder_uid", folderUID)
+
+	folderCtx, _ := identity.WithServiceIdentity(ctx, fr.Cfg.OrgID)
+	user, err := identity.GetRequester(folderCtx)
+	if err != nil {
+		fr.log.Error("failed to get requester for folder deletion", "error", err)
+		return
+	}
+
+	result, err := fr.folderService.Get(folderCtx, &folder.GetFolderQuery{
+		OrgID:        fr.Cfg.OrgID,
+		UID:          &folderUID,
+		SignedInUser: user,
+	})
+	if err != nil {
+		if errors.Is(err, dashboards.ErrFolderNotFound) {
+			fr.log.Debug("Folder already deleted", "folder_uid", folderUID)
+			return
+		}
+		fr.log.Error("failed to get folder for cleanup", "folder_uid", folderUID, "error", err)
+		return
+	}
+
+	if !fr.shouldDeleteFolder(result) {
+		fr.log.Debug("Folder is not managed by provisioning, skipping deletion", "folder_uid", folderUID, "folder_title", result.Title)
+		return
+	}
+
+	fr.log.Info("Deleting orphaned provisioned folder", "folder_uid", folderUID, "folder_title", result.Title)
+	err = fr.folderService.Delete(folderCtx, &folder.DeleteFolderCommand{
+		UID:              folderUID,
+		OrgID:            fr.Cfg.OrgID,
+		SignedInUser:     user,
+		ForceDeleteRules: false,
+	})
+
+	if err != nil {
+		if errors.Is(err, folder.ErrFolderNotEmpty) {
+			fr.log.Debug("Folder still contains resources, skipping deletion", "folder_uid", folderUID, "folder_title", result.Title)
+		} else {
+			fr.log.Error("failed to delete orphaned provisioned folder", "folder_uid", folderUID, "folder_title", result.Title, "error", err)
+		}
+	}
+}
+
+// shouldDeleteFolder checks if a folder can be safely deleted.
+func (fr *FileReader) shouldDeleteFolder(f *folder.Folder) bool {
+	if fr.foldersInUnified {
+		//nolint:staticcheck
+		return string(f.ManagedBy) == string(apimachineryutils.ManagerKindClassicFP)
+	}
+	return true
 }
